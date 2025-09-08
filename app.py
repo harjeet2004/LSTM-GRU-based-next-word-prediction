@@ -11,8 +11,12 @@ MODEL_FILES = {
     "LSTM": "next_word_lstm.h5",
     "GRU":  "next_word_lstm_GRU.h5",
 }
-
 DEFAULT_PROMPT = "To be or not to"
+
+# accuracy eval settings
+CORPUS_PATH = "hamlet.txt"   # use your validation text here
+EVAL_SAMPLE_SIZE = 1000      # sequences per model (kept small for speed)
+EVAL_BATCH_SIZE = 256
 
 # ---------- Caching ----------
 @st.cache_resource(show_spinner=False)
@@ -24,33 +28,78 @@ def load_tokenizer(pkl_path: str = "tokenizer.pkl"):
     with open(pkl_path, "rb") as handle:
         return pickle.load(handle)
 
+@st.cache_data(show_spinner=False)
+def load_corpus_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
 # ---------- Core ----------
 def predict_next_word(model, tokenizer, text, maxseqlen):
     token_list = tokenizer.texts_to_sequences([text])[0]
-
     if len(token_list) >= maxseqlen:
         token_list = token_list[-(maxseqlen - 1):]
-
     token_list = pad_sequences([token_list], maxlen=maxseqlen - 1, padding='pre')
 
-    # prediction
     predicted = model.predict(token_list, verbose=0)
-
-    # get index of top-1 prediction
     predicted_word_index = int(np.argmax(predicted, axis=1)[0])
 
-    # use tokenizer's index -> word mapping if available
     if hasattr(tokenizer, "index_word") and predicted_word_index in tokenizer.index_word:
         return tokenizer.index_word[predicted_word_index]
 
-    # fallback to reverse search (slower)
     for word, index in tokenizer.word_index.items():
         if index == predicted_word_index:
             return word
     return None
 
+def _build_eval_arrays(tokenizer, text: str, maxseqlen: int, sample_size: int):
+    tokens = tokenizer.texts_to_sequences([text])[0]
+    if len(tokens) < maxseqlen:
+        return None, None
+
+    xs, ys = [], []
+    # create next-word pairs
+    for i in range(maxseqlen - 1, len(tokens)):
+        x = tokens[i - (maxseqlen - 1): i]
+        xs.append(x)
+        ys.append(tokens[i])
+
+    X = pad_sequences(xs, maxlen=maxseqlen - 1, padding='pre')
+    y = np.array(ys, dtype=np.int32)
+
+    # uniform sub-sample to keep evaluation fast
+    if len(X) > sample_size:
+        idx = np.linspace(0, len(X) - 1, num=sample_size, dtype=int)
+        X = X[idx]
+        y = y[idx]
+    return X, y
+
+def evaluate_model_accuracy(model_path: str, tokenizer, corpus_path: str,
+                            sample_size: int = EVAL_SAMPLE_SIZE):
+    """Compute Top-1 and Top-5 accuracy on a small eval set from corpus_path."""
+    if not os.path.exists(corpus_path):
+        return None
+
+    model = load_keras_model(model_path)
+    text = load_corpus_text(corpus_path)
+    maxseqlen = (model.input_shape[1] or 0) + 1
+
+    X, y = _build_eval_arrays(tokenizer, text, maxseqlen, sample_size)
+    if X is None or len(X) == 0:
+        return None
+
+    preds = model.predict(X, batch_size=EVAL_BATCH_SIZE, verbose=0)
+
+    # Top-1
+    top1 = preds.argmax(axis=1)
+    top1_acc = float((top1 == y).mean() * 100.0)
+
+    # Top-5
+    top5 = np.argpartition(preds, -5, axis=1)[:, -5:]
+    top5_acc = float(((top5 == y[:, None]).any(axis=1)).mean() * 100.0)
+
+    return {"Top-1 Acc (%)": top1_acc, "Top-5 Acc (%)": top5_acc}
+
 def model_metrics(model_name: str, model_path: str, sample_text: str, tokenizer):
-    # load once (cached) to compute metrics
     model = load_keras_model(model_path)
 
     # Params & layers
@@ -65,25 +114,29 @@ def model_metrics(model_name: str, model_path: str, sample_text: str, tokenizer)
 
     # Inference latency (ms) over N runs
     N = 10
-    # compute maxseqlen compatible with this model
     maxseqlen = (model.input_shape[1] or 0) + 1
 
-    # warmup
+    # warmup + timed runs
     _ = predict_next_word(model, tokenizer, sample_text, maxseqlen)
-
     t0 = time.perf_counter()
     for _ in range(N):
         _ = predict_next_word(model, tokenizer, sample_text, maxseqlen)
     t1 = time.perf_counter()
     avg_ms = (t1 - t0) * 1000.0 / N
 
-    return {
+    # Accuracies (if corpus available)
+    accs = evaluate_model_accuracy(model_path, tokenizer, CORPUS_PATH, EVAL_SAMPLE_SIZE)
+
+    row = {
         "Model": model_name,
         "Parameters": f"{params:,}",
         "Layers": layers,
         "File size (MB)": f"{fsize_mb:.2f}",
         "Avg inference (ms)": f"{avg_ms:.1f}",
+        "Top-1 Acc (%)": f"{accs['Top-1 Acc (%)']:.2f}" if accs else "—",
+        "Top-5 Acc (%)": f"{accs['Top-5 Acc (%)']:.2f}" if accs else "—",
     }
+    return row
 
 # ---------- UI ----------
 st.title('LSTM / GRU Next Word Prediction')
@@ -97,28 +150,26 @@ tokenizer = load_tokenizer()
 # Text input
 input_text = st.text_input("Enter the sequence of Words", DEFAULT_PROMPT)
 
-# Show comparison metrics (both models) for quick reference
+# Show comparison metrics (both models) incl. accuracies
 with st.expander("Model comparison (metrics)"):
     rows = []
     for name, path in MODEL_FILES.items():
         try:
-            rows.append(model_metrics(name, path, input_text or DEFAULT_PROMPT, tokenizer))
+            with st.spinner(f"Evaluating {name}…"):
+                rows.append(model_metrics(name, path, input_text or DEFAULT_PROMPT, tokenizer))
         except Exception as e:
             rows.append({"Model": name, "Parameters": "—", "Layers": "—",
-                         "File size (MB)": "—", "Avg inference (ms)": "—"})
+                         "File size (MB)": "—", "Avg inference (ms)": "—",
+                         "Top-1 Acc (%)": "—", "Top-5 Acc (%)": "—"})
             st.warning(f"Could not compute metrics for {name}: {e}")
     df = pd.DataFrame(rows)
     st.table(df)
 
 # Predict button
 if st.button('Predict Next Word'):
-    # Load the selected model
     selected_model_path = MODEL_FILES[model_choice]
     model = load_keras_model(selected_model_path)
-
-    # Determine max sequence length expected by the model
     maxseqlen = (model.input_shape[1] or 0) + 1
-
     next_word = predict_next_word(model, tokenizer, input_text, maxseqlen)
     st.write(f"**Model:** {model_choice}")
     st.write(f"Next Word: `{next_word}`")
